@@ -101,7 +101,7 @@ def get_device_offset():
 def to_gnuplot_dat():
     device_offset = get_device_offset()
     with open("opencl_profile_0.log") as f0, \
-         open("opencl_profile_1.log") as f1, \
+         open("opencl_profile_3.log") as f1, \
          open("cldat.dat", "w") as outf:
         imd = [{}, {}]
         min_st_box = [None]

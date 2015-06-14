@@ -111,9 +111,9 @@ const char *inc_source =
 
 typedef struct {
     cl_platform_id platform_id;
-    cl_context context;
+    cl_context contexts[2];
     cl_command_queue queues[2];
-    cl_program program;
+    cl_program programs[2];
     cl_kernel knl_inc[2];
 } Memtest;
 
@@ -137,33 +137,39 @@ static void Memtest_init(Memtest *memtest) {
     }
 
     assert(ndevices >= 2);
-    memtest->context = clCreateContext(NULL, 2, device_ids, NULL, NULL, &err);
+    for (idx = 0; idx < 2; idx++) {
+        memtest->contexts[idx] = clCreateContext(NULL, 2, device_ids, NULL, NULL, &err);
+        CHECK_ERROR;
+    }
     printf("# of devices: %d\n", ndevices);
 
-    for (idx = 0; idx < 2; idx++)
-        memtest->queues[idx] = clCreateCommandQueue(memtest->context, device_ids[idx], CL_QUEUE_PROFILING_ENABLE, &err);
-    memtest->program = clCreateProgramWithSource(memtest->context, 1, (const char **)&inc_source, NULL, &err);
-    CHECK_ERROR;
+    for (idx = 0; idx < 2; idx++) {
+        memtest->queues[idx] = clCreateCommandQueue(memtest->contexts[idx], device_ids[idx], CL_QUEUE_PROFILING_ENABLE, &err);
+        CHECK_ERROR;
+        memtest->programs[idx] = clCreateProgramWithSource(memtest->contexts[idx], 1, (const char **)&inc_source, NULL, &err);
+        CHECK_ERROR;
+    }
 
-    err = clBuildProgram(memtest->program, 0, NULL, NULL, NULL, NULL);
-    CHECK_ERROR;
-
-    memtest->knl_inc[0] = clCreateKernel(memtest->program, "inc", &err);
-    CHECK_ERROR;
-    memtest->knl_inc[1] = clCreateKernel(memtest->program, "inc", &err);
-    CHECK_ERROR;
-
+    for (idx = 0; idx < 2; idx++) {
+        err = clBuildProgram(memtest->programs[idx], 0, NULL, NULL, NULL, NULL);
+        CHECK_ERROR;
+        memtest->knl_inc[idx] = clCreateKernel(memtest->programs[idx], "inc", &err);
+        CHECK_ERROR;
+    }
 }
 
 void Memtest_remove(Memtest* memtest) {
     int idx;
-    for (idx = 0; idx < 2; idx++)
+    for (idx = 0; idx < 2; idx++) {
         clReleaseKernel(memtest->knl_inc[idx]);
-    clReleaseProgram(memtest->program);
+        clReleaseProgram(memtest->programs[idx]);
+    }
     for (idx = 0; idx < 2; idx++) {
         clReleaseCommandQueue(memtest->queues[idx]);
     }
-    clReleaseContext(memtest->context);
+    for (idx = 0; idx < 2; idx++) {
+        clReleaseContext(memtest->contexts[idx]);
+    }
 }
 
 typedef struct {
@@ -174,23 +180,19 @@ typedef struct {
     cpu_set_t affinity_mask;
 } MemtestContext;
 
-static void* kernel_work(void *arg) {
+static void unit_work(MemtestContext *ctx) {
 #ifndef NO_BARRIER
 # define setup_barrier sb_spin(ctx->barrier)
 #else 
 # define setup_barrier 
 #endif
-
     cl_int err;
-    MemtestContext *ctx = (MemtestContext *)arg;
-
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &ctx->affinity_mask);
 
     // BARRIER
     setup_barrier;
 
     size_t memsize = ctx->memsize;
-    cl_context cl_ctx = ctx->memtest->context;
+    cl_context cl_ctx = ctx->memtest->contexts[ctx->id];
     cl_command_queue queue = ctx->memtest->queues[ctx->id];
     cl_kernel kernel = ctx->memtest->knl_inc[ctx->id];
 
@@ -215,14 +217,12 @@ static void* kernel_work(void *arg) {
     clock_t st_t = clock();
 
     err = clEnqueueWriteBuffer(queue, mem_arr, CL_TRUE, 0, sizeof(cl_uchar) * memsize, buffer, 0, NULL, NULL); 
-    clFlush(queue);
+    CHECK_ERROR;
 
     // BARRIER
     setup_barrier;
 
     printf("Transfered the buffer to each device..(%.3lf)\n", ((double)st_t / CLOCKS_PER_SEC) * 1000);
-    CHECK_ERROR;
-
 
     size_t gblsize[1] = {memsize};
     size_t lclsize[1] = {128};
@@ -245,10 +245,17 @@ static void* kernel_work(void *arg) {
 
     err = clEnqueueReadBuffer(queue, mem_arr, CL_TRUE, 0, sizeof(cl_uchar) * memsize, buffer, 0, NULL, NULL); 
     CHECK_ERROR;
-    clFlush(queue);
 
     free(buffer);
     clReleaseMemObject(mem_arr);
+}
+
+static void* kernel_work(void *arg) {
+    int idx;
+    MemtestContext *ctx = (MemtestContext *)arg;
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &ctx->affinity_mask);
+    for (idx = 0; idx < 3; idx++)
+        unit_work(ctx);
     return NULL;
 }
 
