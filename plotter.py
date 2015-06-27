@@ -6,11 +6,14 @@ import os
 import math
 
 def to_gnuplot_dat(f, outf):
-    imd = [{}, {}]
+    imd = []
     min_st_box = [None]
     def start_emit():
         pass
     def emit_data(gpu, method, st, ed):
+        if len(imd) <= gpu:
+            for _ in range(gpu - len(imd) + 1):
+                imd.append({})
         gpu_data = imd[gpu]
         d = gpu_data.get(method)
         if d is None:
@@ -22,7 +25,7 @@ def to_gnuplot_dat(f, outf):
     def end_emit():
         min_st = min_st_box[0]
         op_no = 1
-        for gpu in range(2): 
+        for gpu in range(len(imd)): 
             gpu_data = imd[gpu]
             for mtd, st_ed_list in gpu_data.items():
                 label = "GPU%d_%s"%(gpu, mtd)
