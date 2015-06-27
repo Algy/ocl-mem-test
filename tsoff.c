@@ -2,7 +2,9 @@
 #include <stdio.h> 
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include <time.h>
+#include <math.h>
 
 #include <pthread.h>
 #include <sched.h>
@@ -16,7 +18,7 @@
 
 #include "sync.h"
 
-const char *getErrorString(cl_int error) {
+static const char *getErrorString(cl_int error) {
     switch(error){
     // run-time and JIT compiler errors
     case 0: return "CL_SUCCESS";
@@ -99,18 +101,7 @@ const char *getErrorString(cl_int error) {
 } while (0)
 
 
-int main() {
-    srand(time(NULL));
-    /*
-    printf("Setting scheduler policy to FIFO 99...\n");
-    struct sched_param sched_param;
-    sched_param.sched_priority = 99;
-    if (sched_setscheduler(0, SCHED_FIFO, &sched_param)) {
-        printf("Failed to set scheduler policy. Are you root?\n");
-        return 1;
-    }
-    */
-    
+size_t evaluate_timestamp_profile(long long *gpu_ts_profile_ret) {
     int idx;
     cl_int err;
     cl_platform_id platform_id;
@@ -118,7 +109,6 @@ int main() {
 
     err = clGetPlatformIDs(1, &platform_id, &nplatforms);
     CHECK_ERROR;
-
     err = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_GPU, 0, NULL, &ndevices);
     CHECK_ERROR;
 
@@ -127,6 +117,10 @@ int main() {
 
     err = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_GPU, ndevices, device_ids, NULL);
     CHECK_ERROR;
+
+    if (gpu_ts_profile_ret == NULL) {
+        return (size_t)ndevices;
+    }
 
     cl_context context = clCreateContext(NULL, ndevices, device_ids, NULL, NULL, &err);
     CHECK_ERROR;
@@ -144,8 +138,9 @@ int main() {
     }
 
     cl_uchar c[1] = {'A', };
+    cl_event wb_evs[ndevices];
     for (idx = 0; idx < ndevices; idx++) {
-        err = clEnqueueWriteBuffer(queues[idx], dummy_mems[idx], CL_FALSE, 0, sizeof(cl_uchar) * 1, c, 0, NULL, NULL);
+        err = clEnqueueWriteBuffer(queues[idx], dummy_mems[idx], CL_FALSE, 0, sizeof(cl_uchar) * 1, c, 0, NULL, &wb_evs[idx]);
         CHECK_ERROR;
     }
 
@@ -156,6 +151,96 @@ int main() {
     for (idx = 0; idx < ndevices; idx++) {
         clFinish(queues[idx]);
     }
+    cl_ulong queued_t[ndevices];
+    for (idx = 0; idx < ndevices; idx++) {
+        err = clGetEventProfilingInfo(wb_evs[idx], CL_PROFILING_COMMAND_QUEUED, sizeof(cl_ulong), &queued_t[idx], NULL);
+        CHECK_ERROR;
+    }
 
-    return 0;
+    for (idx = 0; idx < ndevices; idx++) {
+        gpu_ts_profile_ret[idx] = (long long)queued_t[idx] - (long long)queued_t[0];
+    }
+
+    for (idx = 0; idx < ndevices; idx++) {
+        clReleaseCommandQueue(queues[idx]);
+        clReleaseMemObject(dummy_mems[idx]);
+        clReleaseEvent(wb_evs[idx]);
+    }
+    clReleaseContext(context);
+
+    return (size_t)nplatforms;
+}
+
+static void print_stat_vll(long long *arr, size_t cnt) {
+    size_t idx;
+    for (idx = 0; idx < cnt; idx++) {
+        fprintf(stderr, " %lld\n", arr[idx]);
+    }
+}
+
+
+static void print_stat_vlf(double *arr, size_t cnt) {
+    size_t idx;
+    for (idx = 0; idx < cnt; idx++) {
+        fprintf(stderr, " %lf\n", arr[idx]);
+    }
+}
+
+
+#define NSAMPLE 8
+size_t average_timestamp_profile(size_t max_gpu, long long *profile_ret) {
+    int idx;
+    long long gpu_cnt;
+
+    gpu_cnt = evaluate_timestamp_profile(NULL);
+    if (gpu_cnt > max_gpu)
+        gpu_cnt = max_gpu;
+
+    long long sum[gpu_cnt];
+    long long avg[gpu_cnt];
+    double stdev[gpu_cnt];
+    long long profile[gpu_cnt];
+    long long sample[NSAMPLE][gpu_cnt];
+
+    for (idx = 0; idx < NSAMPLE; idx++) {
+        evaluate_timestamp_profile(sample[idx]);
+    }
+
+    for (idx = 0; idx < gpu_cnt; idx++) {
+        int jdx;
+        sum[idx] = 0LL;
+        for (jdx = 0; jdx < NSAMPLE; jdx++) {
+            sum[idx] += sample[jdx][idx];
+        }
+        avg[idx] = sum[idx] / NSAMPLE;
+        profile[idx] = avg[idx];
+    }
+
+    for (idx = 0; idx < gpu_cnt; idx++) {
+        stdev[idx] = 0LL;
+        int jdx;
+        for (jdx = 0; jdx < NSAMPLE; jdx++) {
+            long long factor = sample[jdx][idx] - avg[idx];
+            stdev[idx] += (double)(factor * factor) / NSAMPLE;
+        }
+        stdev[idx] = sqrt(stdev[idx]);
+    }
+
+
+    fprintf(stderr, "Timestamp profile Summary\n");
+    fprintf(stderr, "======\n");
+    fprintf(stderr, "N = %d\n", NSAMPLE);
+    fprintf(stderr, "avg = \n");
+    print_stat_vll(avg, gpu_cnt);
+    fprintf(stderr, "stdev = \n");
+    print_stat_vlf(stdev, gpu_cnt);
+    fprintf(stderr, "samples = \n");
+    for (idx = 0; idx < NSAMPLE; idx++) {
+        fprintf(stderr, "%d:\n", idx);
+        print_stat_vll(sample[idx], gpu_cnt);
+    }
+    fprintf(stderr, "End of summary.\n");
+
+    memcpy(profile_ret, profile, sizeof(profile[0]) * gpu_cnt);
+    return gpu_cnt;
 }

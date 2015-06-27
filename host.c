@@ -1,8 +1,13 @@
 #define _GNU_SOURCE
+#define _XOPEN_SOURCE
 #include <stdio.h> 
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include <time.h>
+#include <getopt.h>
+#include <limits.h>
+#include <errno.h>
 
 #include <pthread.h>
 #include <sched.h>
@@ -15,9 +20,10 @@
 #endif
 
 #include "sync.h"
+#include "tsoff.h"
 
-const char *getErrorString(cl_int error) {
-    switch(error){
+static const char *getErrorString(cl_int error) {
+    switch(error) {
     // run-time and JIT compiler errors
     case 0: return "CL_SUCCESS";
     case -1: return "CL_DEVICE_NOT_FOUND";
@@ -109,24 +115,129 @@ const char *inc_source =
     "           arr[idx] *= 5; \n" \
     "}";
 
+struct {
+    bool fill_zero;
+
+    ssize_t memsize;
+
+    bool use_ts_profile_file;
+    char ts_profile_path[1024];
+
+    bool use_ts_profile_str;
+    char ts_profile_str[1024]; /* sperated by ":", like 202:-22902:22... (in nanoseconds) */
+
+    bool use_rw_offsets;
+    char rw_offsets_str[1024]; /* same as above */
+
+    unsigned long long gpu_flag;
+
+    bool use_fifo99;
+
+    int run_count;
+} program_option;
+
+typedef struct {
+    int gpu_id;
+    char *op_name;
+    long long queued_time;
+    long long submitted_time;
+    long long start_time;
+    long long end_time;
+    long long exec_time;
+} GpuLogRecord;
+
+#define MAX_GPU 32
+#define MAX_LOG 1024
+typedef struct {
+    GpuLogRecord records_per_gpu[MAX_GPU][MAX_LOG];
+    size_t gpu_log_cnt[MAX_GPU];
+    bool is_flooded[MAX_GPU];
+    size_t gpu_cnt;
+} GpuLog;
+
+static void GpuLog_init(GpuLog *logger, size_t gpu_cnt) {
+    int idx;
+
+    logger->gpu_cnt = gpu_cnt;
+    for (idx = 0; idx < gpu_cnt; idx++) {
+        logger->is_flooded[idx] = false;
+        logger->gpu_log_cnt[idx] = 0;
+    }
+}
+
+static void GpuLog_log(GpuLog *logger, int gpu_id, char *op_name, long long ts_delta, cl_event ev) {
+    cl_int err;
+
+    size_t log_cnt = logger->gpu_log_cnt[gpu_id];
+    if (log_cnt >= MAX_LOG)
+        logger->is_flooded[gpu_id] = true;
+    else {
+        cl_ulong queued_time, submitted_time, start_time, end_time;
+        err = clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_QUEUED, sizeof(cl_ulong), &queued_time, NULL);
+        CHECK_ERROR;
+        err = clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_SUBMIT, sizeof(cl_ulong), &submitted_time, NULL);
+        CHECK_ERROR;
+        err = clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &start_time, NULL);
+        CHECK_ERROR;
+        err = clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &end_time, NULL);
+        CHECK_ERROR;
+
+        if (queued_time == 0) {
+            fprintf(stderr, "[Warning] GPU%d %s: queued_time is 0\n", gpu_id, op_name);
+        }
+        if (submitted_time == 0) {
+            fprintf(stderr, "[Warning] GPU%d %s: submitted_time is 0\n", gpu_id, op_name);
+        }
+        if (start_time == 0) {
+            fprintf(stderr, "[Warning] GPU%d %s: start_time is 0\n", gpu_id, op_name);
+        }
+        if (end_time == 0) {
+            fprintf(stderr, "[Warning] GPU%d %s: end_time is 0\n", gpu_id, op_name);
+        }
+
+        logger->records_per_gpu[gpu_id][log_cnt] = (GpuLogRecord) {
+            .gpu_id = gpu_id,
+            .op_name = op_name,
+            .queued_time = (long long)queued_time - ts_delta,
+            .submitted_time = (long long)submitted_time - ts_delta,
+            .start_time = (long long)start_time - ts_delta,
+            .end_time = (long long)end_time - ts_delta,
+            .exec_time = (long long)(end_time - start_time)
+        };
+        logger->gpu_log_cnt[gpu_id]++;
+    }
+}
+
 typedef struct {
     cl_platform_id platform_id;
-    cl_context contexts[2];
-    cl_command_queue queues[2];
-    cl_program programs[2];
-    cl_kernel knl_inc[2];
+    size_t ndevices;
+
+    cl_context contexts[MAX_GPU];
+    cl_command_queue queues[MAX_GPU];
+    cl_program programs[MAX_GPU];
+    cl_kernel knl_inc[MAX_GPU];
+
 } Memtest;
 
 static void Memtest_init(Memtest *memtest) {
     int idx;
     cl_int err;
     cl_uint platform_num, ndevices;
-    cl_device_id device_ids[2];
 
     err = clGetPlatformIDs(1, &memtest->platform_id, &platform_num);
     CHECK_ERROR;
 
-    err = clGetDeviceIDs(memtest->platform_id, CL_DEVICE_TYPE_GPU, 2, device_ids, &ndevices);
+    err = clGetDeviceIDs(memtest->platform_id, CL_DEVICE_TYPE_GPU, 0, NULL, &ndevices);
+    CHECK_ERROR;
+
+    if (ndevices >= MAX_GPU)
+        ndevices = MAX_GPU;
+    fprintf(stderr, "# of devices: %d\n", ndevices);
+    memtest->ndevices = ndevices;
+
+    cl_device_id device_ids[ndevices];
+
+    err = clGetDeviceIDs(memtest->platform_id, CL_DEVICE_TYPE_GPU, ndevices, device_ids, NULL);
     CHECK_ERROR;
 
 
@@ -136,21 +247,19 @@ static void Memtest_init(Memtest *memtest) {
         fprintf(stderr, "device [%d]: %s\n", idx, device_name);
     }
 
-    assert(ndevices >= 2);
-    for (idx = 0; idx < 2; idx++) {
-        memtest->contexts[idx] = clCreateContext(NULL, 2, device_ids, NULL, NULL, &err);
+    for (idx = 0; idx < ndevices; idx++) {
+        memtest->contexts[idx] = clCreateContext(NULL, ndevices, device_ids, NULL, NULL, &err);
         CHECK_ERROR;
     }
-    printf("# of devices: %d\n", ndevices);
 
-    for (idx = 0; idx < 2; idx++) {
+    for (idx = 0; idx < ndevices; idx++) {
         memtest->queues[idx] = clCreateCommandQueue(memtest->contexts[idx], device_ids[idx], CL_QUEUE_PROFILING_ENABLE, &err);
         CHECK_ERROR;
         memtest->programs[idx] = clCreateProgramWithSource(memtest->contexts[idx], 1, (const char **)&inc_source, NULL, &err);
         CHECK_ERROR;
     }
 
-    for (idx = 0; idx < 2; idx++) {
+    for (idx = 0; idx < ndevices; idx++) {
         err = clBuildProgram(memtest->programs[idx], 0, NULL, NULL, NULL, NULL);
         CHECK_ERROR;
         memtest->knl_inc[idx] = clCreateKernel(memtest->programs[idx], "inc", &err);
@@ -160,22 +269,55 @@ static void Memtest_init(Memtest *memtest) {
 
 void Memtest_remove(Memtest* memtest) {
     int idx;
-    for (idx = 0; idx < 2; idx++) {
+    size_t ndevices = memtest->ndevices;
+    for (idx = 0; idx < ndevices; idx++) {
         clReleaseKernel(memtest->knl_inc[idx]);
         clReleaseProgram(memtest->programs[idx]);
     }
-    for (idx = 0; idx < 2; idx++) {
+    for (idx = 0; idx < ndevices; idx++) {
         clReleaseCommandQueue(memtest->queues[idx]);
     }
-    for (idx = 0; idx < 2; idx++) {
+    for (idx = 0; idx < ndevices; idx++) {
         clReleaseContext(memtest->contexts[idx]);
     }
 }
 
+static void spin_wait(long long rw_offset) {
+    if (rw_offset > 0) {
+        struct timespec st_ts;
+        clock_gettime(CLOCK_MONOTONIC, &st_ts);
+        while (1) {
+            struct timespec cur_ts;
+            if (clock_gettime(CLOCK_MONOTONIC, &cur_ts) == -1) {
+                perror("clock_gettime()");
+                abort();
+            }
+            long long elapsed_ms = (cur_ts.tv_sec - st_ts.tv_sec) * 1000LL + (cur_ts.tv_nsec - st_ts.tv_nsec) / 1000000LL;
+            int idx;
+            if (elapsed_ms >= rw_offset)
+                break;
+            for (idx = 0; idx < 10000; idx++); // spin for a while
+        }
+    }
+}
+
+typedef struct {
+    bool randomize_buffer;
+    GpuLog *logger;
+    size_t memsize;
+
+    long long gpu_ts_profile[MAX_GPU];
+    long long rw_offsets[MAX_GPU];
+
+    unsigned long long gpu_flag;
+    int run_count;
+} MemtestSharedInfo;
+
 typedef struct {
     Memtest *memtest;
+    MemtestSharedInfo *shared_info;
+
     int id;
-    size_t memsize;
     SpinningBarrier *barrier;
     cpu_set_t affinity_mask;
 } MemtestContext;
@@ -187,19 +329,39 @@ static void unit_work(MemtestContext *ctx) {
 # define setup_barrier 
 #endif
     cl_int err;
+    int idx;
 
     // BARRIER
     setup_barrier;
 
-    size_t memsize = ctx->memsize;
-    cl_context cl_ctx = ctx->memtest->contexts[ctx->id];
-    cl_command_queue queue = ctx->memtest->queues[ctx->id];
-    cl_kernel kernel = ctx->memtest->knl_inc[ctx->id];
+    int gpu_id = ctx->id;
+    size_t memsize = ctx->shared_info->memsize;
+    cl_context cl_ctx = ctx->memtest->contexts[gpu_id];
+    cl_command_queue queue = ctx->memtest->queues[gpu_id];
+    cl_kernel kernel = ctx->memtest->knl_inc[gpu_id];
 
-    cl_uchar *buffer = calloc(sizeof(cl_uchar), ctx->memsize);
+    long long ts_delta = ctx->shared_info->gpu_ts_profile[gpu_id];
+    long long rw_offset_min = LLONG_MAX;
+    for (idx = 0; idx < ctx->memtest->ndevices; idx++) {
+        if (rw_offset_min > ctx->shared_info->rw_offsets[idx])
+            rw_offset_min = ctx->shared_info->rw_offsets[idx];
+    }
+    long long rw_offset = ctx->shared_info->rw_offsets[gpu_id] - rw_offset_min;
+
+
+    cl_uchar *buffer = calloc(memsize, sizeof(cl_uchar));
     if (!buffer) {
-        printf("Out of Memory\n");
+        fprintf(stderr, "Out of Memory\n");
         abort();
+    }
+
+    if (ctx->shared_info->randomize_buffer) {
+        unsigned int seed = (unsigned int)time(NULL);
+        cl_uchar* b_iter, *b_end;
+        b_end = buffer + memsize;
+        for (b_iter = buffer; b_iter < b_end; b_iter++) {
+            *b_iter = (cl_uchar)rand_r(&seed);
+        }
     }
 
     // BARRIER
@@ -208,24 +370,30 @@ static void unit_work(MemtestContext *ctx) {
     cl_mem mem_arr;
     mem_arr = clCreateBuffer(cl_ctx, CL_MEM_READ_WRITE, sizeof(cl_uchar) * memsize, NULL, &err);
     CHECK_ERROR;
-    printf("Created a buffer\n");
-    printf("[%d]Starting to transfer the buffer to each device..\n", ctx->id);
+    fprintf(stderr, "Created a buffer\n");
+    fprintf(stderr, "[%d]Starting to transfer the buffer to each device..\n", gpu_id);
 
     // BARRIER
     setup_barrier;
-
+    spin_wait(rw_offset);
     clock_t st_t = clock();
 
-    err = clEnqueueWriteBuffer(queue, mem_arr, CL_TRUE, 0, sizeof(cl_uchar) * memsize, buffer, 0, NULL, NULL); 
+    cl_event h2d_ev, d2h_ev, kernel_ev;
+    err = clEnqueueWriteBuffer(queue, mem_arr, CL_TRUE, 0, sizeof(cl_uchar) * memsize, buffer, 0, NULL, &h2d_ev);
     CHECK_ERROR;
+
+    clFinish(queue);
+    clWaitForEvents(1, &h2d_ev);
+    GpuLog_log(ctx->shared_info->logger, gpu_id, "H2DMemcpy", ts_delta, h2d_ev);
+    clReleaseEvent(h2d_ev);
 
     // BARRIER
     setup_barrier;
 
-    printf("Transfered the buffer to each device..(%.3lf)\n", ((double)st_t / CLOCKS_PER_SEC) * 1000);
+    fprintf(stderr, "Transfered the buffer to each device..(%.3lf)\n", ((double)st_t / CLOCKS_PER_SEC) * 1000);
 
     size_t gblsize[1] = {memsize};
-    size_t lclsize[1] = {128};
+    size_t lclsize[1] = {memsize > 128? 128 : memsize};
 
     err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &mem_arr);
     CHECK_ERROR;
@@ -236,35 +404,50 @@ static void unit_work(MemtestContext *ctx) {
     // BARRIER
     setup_barrier;
 
-    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gblsize, lclsize, 0, NULL, NULL);
+    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, gblsize, lclsize, 0, NULL, &kernel_ev);
     CHECK_ERROR;
-    clFlush(queue);
+
+    clFinish(queue);
+    clWaitForEvents(1, &kernel_ev);
+    GpuLog_log(ctx->shared_info->logger, gpu_id, "kernel_inc", ts_delta, kernel_ev);
+    clReleaseEvent(kernel_ev);
 
     // BARRIER
     setup_barrier;
+    spin_wait(rw_offset);
 
-    err = clEnqueueReadBuffer(queue, mem_arr, CL_TRUE, 0, sizeof(cl_uchar) * memsize, buffer, 0, NULL, NULL); 
+    err = clEnqueueReadBuffer(queue, mem_arr, CL_TRUE, 0, sizeof(cl_uchar) * memsize, buffer, 0, NULL, &d2h_ev); 
     CHECK_ERROR;
+
+    clFinish(queue);
+    clWaitForEvents(1, &d2h_ev);
+    GpuLog_log(ctx->shared_info->logger, gpu_id, "D2HMemcpy", ts_delta, d2h_ev);
+    clReleaseEvent(d2h_ev);
 
     free(buffer);
     clReleaseMemObject(mem_arr);
+#undef setup_barrier
 }
 
 static void* kernel_work(void *arg) {
     int idx;
     MemtestContext *ctx = (MemtestContext *)arg;
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &ctx->affinity_mask);
-    for (idx = 0; idx < 3; idx++)
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &ctx->affinity_mask)) {
+        fprintf(stderr, "Warning: Failed to set affinity of thread assigned to gpu %d[%s:%d]\n", ctx->id, __FILE__, __LINE__);
+    }
+    for (idx = 0; idx < ctx->shared_info->run_count; idx++)
         unit_work(ctx);
     return NULL;
 }
 
-static void Memtest_run(Memtest *memtest, unsigned int gpu_flag, size_t memsize) {
+static void Memtest_run(Memtest *memtest, MemtestSharedInfo *shared_info) {
     int idx;
     unsigned int nthread = 0;
     int gpu_max = 0;
 
-    unsigned int gpu_iter;
+    unsigned long long gpu_iter, gpu_flag;
+
+    gpu_flag = shared_info->gpu_flag;
     for (gpu_iter = gpu_flag; gpu_iter; gpu_iter >>= 1) {
         gpu_max++;
         if (gpu_iter & 1)
@@ -280,10 +463,12 @@ static void Memtest_run(Memtest *memtest, unsigned int gpu_flag, size_t memsize)
     int cnt = 0;
     for (idx = 0; idx < gpu_max; idx++) {
         if (gpu_flag & (1u << idx)) {
-            contexts[cnt].memtest = memtest;
-            contexts[cnt].id = idx;
-            contexts[cnt].memsize = memsize;
-            contexts[cnt].barrier = &shared_barrier;
+            contexts[cnt] = (MemtestContext) {
+                .memtest = memtest,
+                .shared_info = shared_info,
+                .id = idx,
+                .barrier = &shared_barrier
+            };
             CPU_ZERO(&contexts[cnt].affinity_mask);
             CPU_SET(cnt, &contexts[cnt].affinity_mask);
             cnt++;
@@ -302,38 +487,327 @@ static void Memtest_run(Memtest *memtest, unsigned int gpu_flag, size_t memsize)
     }
 }
 
-int main(int argc, char** argv) {
-    srand(time(NULL));
-    if (argc < 3) {
-        printf("Usage -- [program] flag memsize\n");
-        return 0;
+
+static void print_option() {
+    fprintf(stderr, "Usage\n");
+    fprintf(stderr, "-----\n");
+}
+
+static inline bool parsell(char *s, long long *ret) {
+    char *endpnt;
+    *ret = strtoll(s, &endpnt, 10);
+    if (*endpnt)
+        return false;
+    else
+        return true;
+}
+
+
+static bool parse_option(int argc, char **argv) {
+#define FLAG_FILL_BUFFER_WITH_ZERO 0
+#define FLAG_MB 1
+#define FLAG_KB 2
+#define FLAG_BYTE 3
+#define FLAG_TIMESTAMP_PROFILE 4
+#define FLAG_TIMESTAMP_PROFILE_PATH 5
+#define FLAG_GPU_FLAG 6
+#define FLAG_USE_FIFO99 7
+#define FLAG_RUN_COUNT 8
+#define FLAG_RW_OFFSETS 9
+
+    static struct option opts [] = {
+        {"fill-zero", no_argument, 0, FLAG_FILL_BUFFER_WITH_ZERO},
+        {"mb", required_argument, 0, FLAG_MB},
+        {"kb", required_argument, 0, FLAG_KB},
+        {"byte", required_argument, 0, FLAG_BYTE},
+        {"timestamp-profile", required_argument, 0, FLAG_TIMESTAMP_PROFILE},
+        {"timestamp-profile-path", required_argument, 0, FLAG_TIMESTAMP_PROFILE_PATH},
+        {"gpu-flag", required_argument, 0, FLAG_GPU_FLAG},
+        {"use-fifo99", no_argument, 0, FLAG_USE_FIFO99},
+        {"run-count", required_argument, 0, FLAG_RUN_COUNT},
+        {"rw-offsets", required_argument, 0, FLAG_RW_OFFSETS},
+        {0, 0, 0, 0}
+    };
+
+    program_option.fill_zero = false;
+    program_option.memsize = -1;
+    program_option.use_ts_profile_file = false;
+    program_option.use_ts_profile_str = false;
+    program_option.use_rw_offsets = false;
+    program_option.gpu_flag = 0;
+    program_option.use_fifo99 = false;
+    program_option.run_count = 1;
+
+    int longopt_idx;
+    int flag;
+    while ((flag = getopt_long(argc, argv, "", opts, &longopt_idx)) != -1) {
+        switch (flag) {
+            case FLAG_FILL_BUFFER_WITH_ZERO:
+                program_option.fill_zero = true;
+                break;
+            case FLAG_MB:
+            {
+                long long mb;
+                if (!parsell(optarg, &mb)) {
+                    fprintf(stderr, "--mb: %s is not a number\n", optarg);
+                    return false;
+                }
+                program_option.memsize = mb * 1024 * 1024;
+                break;
+            }
+            case FLAG_KB:
+            {
+                long long kb;
+                if (!parsell(optarg, &kb)) {
+                    fprintf(stderr, "--kb: %s is not a number\n", optarg);
+                    return false;
+                }
+                program_option.memsize = kb * 1024;
+                break;
+            }
+            case FLAG_BYTE:
+            {
+                long long byte;
+                if (!parsell(optarg, &byte)) {
+                    fprintf(stderr, "--byte: %s is not a number\n", optarg);
+                    return false;
+                }
+                program_option.memsize = byte;
+                break;
+            }
+            case FLAG_TIMESTAMP_PROFILE:
+            {
+                program_option.use_ts_profile_str = true;
+                strncpy(program_option.ts_profile_str, optarg, 1023);
+                break;
+            }
+            case FLAG_TIMESTAMP_PROFILE_PATH:
+            {
+                program_option.use_ts_profile_file = true;
+                strncpy(program_option.ts_profile_path, optarg, 1023);
+                break;
+            }
+            case FLAG_GPU_FLAG:
+            {
+                long long gpu_flag;
+                if (!parsell(optarg, &gpu_flag)) {
+                    fprintf(stderr, "--gpu-flag: %s is not a number\n", optarg);
+                    return false;
+                }
+                program_option.gpu_flag = (unsigned long long)gpu_flag;
+                break;
+            }
+            case FLAG_USE_FIFO99:
+                program_option.use_fifo99 = true;
+                break;
+            case FLAG_RUN_COUNT:
+            {
+                long long run_count;
+                if (!parsell(optarg, &run_count)) {
+                    fprintf(stderr, "--run-count: %s is not a number\n", optarg);
+                    return false;
+                }
+                program_option.run_count = (int)run_count;
+                break;
+            }
+            case FLAG_RW_OFFSETS:
+            {
+                program_option.use_rw_offsets = true;
+                strncpy(program_option.rw_offsets_str, optarg, 1023);
+                break;
+            }
+            case '?':
+                print_option();
+                return false;
+        }
     }
-    printf("Setting scheduler policy to FIFO 99...\n");
-    struct sched_param sched_param;
-    sched_param.sched_priority = 99;
-    if (sched_setscheduler(0, SCHED_FIFO, &sched_param)) {
-        printf("Failed to set scheduler policy. Are you root?\n");
+    if (program_option.memsize == -1) {
+        fprintf(stderr, "Memsize(byte, kb, mb) has not been specified!\n");
+        return false;
+    }
+    if (program_option.gpu_flag == 0) {
+        fprintf(stderr, "No gpu to use. abort.\n");
+        return false;
+    }
+    return true;
+}
+
+static ssize_t parse_colon_str(char *s, size_t max_cnt, long long *out) {
+    char *p, *next;
+    ssize_t cnt = 0;
+
+    next = s - 1;
+    do {
+        p = next + 1;
+        next = strstr(p, ":");
+        if (next == NULL)
+            next = p + strlen(p);
+
+        char num_str[1024];
+        strncpy(num_str, p, next - p);
+        *(num_str + strlen(num_str)) = 0;
+
+        char *endpnt;
+
+        long long num;
+
+        if (!*num_str) {
+            num = 0;
+        } else {
+            num = strtoll(num_str, &endpnt, 10);
+            if (*endpnt) {
+                return -1;
+            }
+        }
+        if (cnt < max_cnt)
+            out[cnt++] = num;
+        else
+            return cnt;
+    } while (*next);
+    return cnt;
+}
+
+static bool get_memtest_shared_info(MemtestSharedInfo *shared_info, GpuLog *logger) {
+    shared_info->randomize_buffer = !program_option.fill_zero;
+    shared_info->logger = logger;
+    shared_info->memsize = program_option.memsize;
+
+
+    memset(shared_info->gpu_ts_profile, 0, sizeof(shared_info->gpu_ts_profile[0]) * MAX_GPU);
+    memset(shared_info->rw_offsets, 0, sizeof(shared_info->rw_offsets[0]) * MAX_GPU);
+    if (program_option.use_ts_profile_str) {
+        if (parse_colon_str(program_option.ts_profile_str, MAX_GPU, shared_info->gpu_ts_profile) == -1) {
+            fprintf(stderr, "--timestamp-profile: not a valid format\n");
+            return false;
+        }
+    } else {
+        char *ts_profile_path = NULL;
+        bool fp_success = false;
+
+        if (program_option.use_ts_profile_file) {
+            ts_profile_path = program_option.ts_profile_path;
+        }
+
+        if (ts_profile_path) {
+            FILE *fp = fopen(ts_profile_path, "r");
+            if (fp) {
+                char buf[1024];
+                size_t bytes_read;
+                bytes_read = fread(buf, 1023, sizeof(char), fp);
+                buf[bytes_read] = 0;
+                fclose(fp);
+
+                if (parse_colon_str(buf, MAX_GPU, shared_info->gpu_ts_profile) == -1) {
+                    fprintf(stderr, "--timestamp-profile-path: the content of file has invalid format\n");
+                    return false;
+                }
+                fp_success = true;
+            } else if (errno != ENOENT) {
+                fprintf(stderr, "Error occurred while reading from profile file '%s'", ts_profile_path);
+                perror("");
+                return false;
+            }
+        }
+
+        if (!fp_success) {
+            size_t gpu_cnt = average_timestamp_profile(MAX_GPU, shared_info->gpu_ts_profile);
+            if (ts_profile_path) {
+                FILE *fp = fopen(ts_profile_path, "w");
+                if (!fp) {
+                    fprintf(stderr, "Error occurred while writing to profile file '%s'", ts_profile_path);
+                    perror("");
+                    return false;
+                }
+                int idx;
+                if (gpu_cnt > 0) {
+                    fprintf(fp, "%lld", shared_info->gpu_ts_profile[0]);
+                    for (idx = 1; idx < gpu_cnt; idx++) {
+                        fprintf(fp, ":%lld", shared_info->gpu_ts_profile[idx]);
+                    }
+                }
+                fclose(fp);
+            }
+        }
+    }
+
+    if (program_option.use_rw_offsets) {
+        if (parse_colon_str(program_option.rw_offsets_str, MAX_GPU, shared_info->rw_offsets) == -1) {
+            fprintf(stderr, "--rw-offsets: invalid format\n");
+            return false;
+        }
+    }
+    shared_info->gpu_flag = program_option.gpu_flag;
+    shared_info->run_count = program_option.run_count;
+    return true;
+}
+
+int main(int argc, char** argv) {
+    if (!parse_option(argc, argv)) {
         return 1;
     }
 
-    unsigned int gpu_flag = (unsigned int)strtol(argv[1], NULL, 10);
-    size_t memsize = (size_t)strtol(argv[2], NULL, 10) * 1024 * 1024;
-
+    if (program_option.use_fifo99) {
+        printf("Setting scheduler policy to FIFO 99...\n");
+        struct sched_param sched_param;
+        sched_param.sched_priority = 99;
+        if (sched_setscheduler(0, SCHED_FIFO, &sched_param)) {
+            printf("Failed to set scheduler policy. Are you root?\n");
+            return 1;
+        }
+    }
     int gpu_idx = 0;
-    unsigned int gpu_iter;
-    for (gpu_iter = gpu_flag; gpu_iter; gpu_iter >>= 1) {
+    unsigned long long gpu_iter;
+    for (gpu_iter = program_option.gpu_flag; gpu_iter; gpu_iter >>= 1) {
         if (gpu_iter & 1)
-            printf("Use GPU%d\n", gpu_idx);
+            fprintf(stderr, "Use GPU%d\n", gpu_idx);
         gpu_idx++;
     }
-    printf("Memory size: %zu MB\n", memsize / 1024 / 1024);
-    if (memsize == 0) {
-        memsize = 512;
+
+    if (program_option.memsize == 0) {
+        program_option.memsize = 1;
+    }
+
+    fprintf(stderr, "Memory size: %zu Byte", program_option.memsize);
+    if (program_option.memsize >= 1024 * 1024) {
+        fprintf(stderr, "(%zu MB)", program_option.memsize / 1024 / 1024);
+    } else if (program_option.memsize >= 1024) {
+        fprintf(stderr, "(%zu KB)", program_option.memsize / 1024);
+    }
+    fprintf(stderr, "\n");
+
+    GpuLog logger;
+    MemtestSharedInfo shared_info;
+
+
+    int gpu_cnt = evaluate_timestamp_profile(NULL);
+    GpuLog_init(&logger, gpu_cnt);
+
+    if (!get_memtest_shared_info(&shared_info, &logger)) {
+        return 1;
     }
     
     Memtest memtest;
     Memtest_init(&memtest);
-    Memtest_run(&memtest, gpu_flag, memsize);
+    Memtest_run(&memtest, &shared_info);
     Memtest_remove(&memtest);
+
+    int gpu, idx;
+    long long min_time = LLONG_MAX;
+    for (gpu = 0; gpu < logger.gpu_cnt; gpu++) {
+        size_t gpu_log_cnt = logger.gpu_log_cnt[gpu];
+        for (idx = 0; idx < gpu_log_cnt; idx++) {
+            GpuLogRecord *record = &logger.records_per_gpu[gpu][idx];
+            if (min_time > record->queued_time) {
+                min_time = record->queued_time;
+            }
+        }
+    }
+    for (gpu = 0; gpu < logger.gpu_cnt; gpu++) {
+        size_t gpu_log_cnt = logger.gpu_log_cnt[gpu];
+        for (idx = 0; idx < gpu_log_cnt; idx++) {
+            GpuLogRecord *record = &logger.records_per_gpu[gpu][idx];
+            printf("%d %s %lld %lld %lld\n", record->gpu_id, record->op_name, record->start_time - min_time, record->end_time - min_time, record->exec_time);
+        }
+    }
     return 0;
 }
