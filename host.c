@@ -137,6 +137,9 @@ struct {
     bool use_fifo99;
 
     int run_count;
+
+    bool mixed_mode;
+    int leader_id;
 } program_option;
 
 typedef struct {
@@ -313,6 +316,9 @@ typedef struct {
 
     unsigned long long gpu_flag;
     int run_count;
+
+    bool mixed_mode;
+    int leader_id;
 } MemtestSharedInfo;
 
 typedef struct {
@@ -332,6 +338,9 @@ static void unit_work(MemtestContext *ctx) {
 #endif
     cl_int err;
     int idx;
+
+    bool mixed_mode = ctx->shared_info->mixed_mode;
+    int leader_id = ctx->shared_info->leader_id;
 
     // BARRIER
     setup_barrier;
@@ -377,6 +386,11 @@ static void unit_work(MemtestContext *ctx) {
 
     // BARRIER
     setup_barrier;
+    if (mixed_mode && gpu_id != leader_id) {
+        setup_barrier;
+        setup_barrier;
+        setup_barrier;
+    }
     spin_wait(rw_offset);
     clock_t st_t = clock();
 
@@ -428,6 +442,11 @@ static void unit_work(MemtestContext *ctx) {
 
     free(buffer);
     clReleaseMemObject(mem_arr);
+    if (mixed_mode && gpu_id == leader_id) {
+        setup_barrier;
+        setup_barrier;
+        setup_barrier;
+    }
 #undef setup_barrier
 }
 
@@ -516,6 +535,7 @@ static bool parse_option(int argc, char **argv) {
 #define FLAG_USE_FIFO99 7
 #define FLAG_RUN_COUNT 8
 #define FLAG_RW_OFFSETS 9
+#define FLAG_LEADER_ID 10
 
     static struct option opts [] = {
         {"fill-zero", no_argument, 0, FLAG_FILL_BUFFER_WITH_ZERO},
@@ -528,6 +548,7 @@ static bool parse_option(int argc, char **argv) {
         {"use-fifo99", no_argument, 0, FLAG_USE_FIFO99},
         {"run-count", required_argument, 0, FLAG_RUN_COUNT},
         {"rw-offsets", required_argument, 0, FLAG_RW_OFFSETS},
+        {"leader-id", required_argument, 0, FLAG_LEADER_ID},
         {0, 0, 0, 0}
     };
 
@@ -538,6 +559,7 @@ static bool parse_option(int argc, char **argv) {
     program_option.gpu_flag = 0;
     program_option.use_fifo99 = false;
     program_option.run_count = 1;
+    program_option.leader_id = -1;
 
     int longopt_idx;
     int flag;
@@ -610,6 +632,16 @@ static bool parse_option(int argc, char **argv) {
                 strncpy(program_option.rw_offsets_str, optarg, 1023);
                 break;
             }
+            case FLAG_LEADER_ID:
+            {
+                long long li;
+                if (!parsell(optarg, &li)) { 
+                    fprintf(stderr, "--leader-id: %s is not a number\n", optarg);
+                    return false;
+                }
+                program_option.leader_id = (int)li;
+                break;
+            }
             case '?':
                 print_option();
                 return false;
@@ -624,6 +656,7 @@ static bool parse_option(int argc, char **argv) {
         fprintf(stderr, "No gpu to use. abort.\n");
         return false;
     }
+
 
     int idx;
     long long memsize_size_t[MAX_GPU];
@@ -641,6 +674,9 @@ static bool parse_option(int argc, char **argv) {
     }
     for (idx = 0; idx < MAX_GPU; idx++)
         program_option.memsize[idx] *= memsize_coef;
+    program_option.mixed_mode = program_option.leader_id != -1;
+    if (program_option.mixed_mode)
+        fprintf(stderr, "MIXED MODE. leader-id=%d\n", program_option.leader_id);
     return true;
 }
 
@@ -750,6 +786,8 @@ static bool get_memtest_shared_info(MemtestSharedInfo *shared_info, GpuLog *logg
     }
     shared_info->gpu_flag = program_option.gpu_flag;
     shared_info->run_count = program_option.run_count;
+    shared_info->leader_id = program_option.leader_id;
+    shared_info->mixed_mode = program_option.mixed_mode;
     return true;
 }
 
