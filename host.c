@@ -22,6 +22,8 @@
 #include "sync.h"
 #include "tsoff.h"
 
+#define MAX_GPU 32
+
 static const char *getErrorString(cl_int error) {
     switch(error) {
     // run-time and JIT compiler errors
@@ -115,10 +117,11 @@ const char *inc_source =
     "           arr[idx] *= 5; \n" \
     "}";
 
+static ssize_t parse_colon_str(char *s, size_t max_cnt, long long *out);
 struct {
     bool fill_zero;
 
-    ssize_t memsize;
+    size_t memsize[MAX_GPU];
 
     bool use_ts_profile_file;
     char ts_profile_path[1024];
@@ -146,7 +149,6 @@ typedef struct {
     long long exec_time;
 } GpuLogRecord;
 
-#define MAX_GPU 32
 #define MAX_LOG 1024
 typedef struct {
     GpuLogRecord records_per_gpu[MAX_GPU][MAX_LOG];
@@ -304,7 +306,7 @@ static void spin_wait(long long rw_offset) {
 typedef struct {
     bool randomize_buffer;
     GpuLog *logger;
-    size_t memsize;
+    size_t memsize[MAX_GPU];
 
     long long gpu_ts_profile[MAX_GPU];
     long long rw_offsets[MAX_GPU];
@@ -335,7 +337,7 @@ static void unit_work(MemtestContext *ctx) {
     setup_barrier;
 
     int gpu_id = ctx->id;
-    size_t memsize = ctx->shared_info->memsize;
+    size_t memsize = ctx->shared_info->memsize[gpu_id];
     cl_context cl_ctx = ctx->memtest->contexts[gpu_id];
     cl_command_queue queue = ctx->memtest->queues[gpu_id];
     cl_kernel kernel = ctx->memtest->knl_inc[gpu_id];
@@ -530,7 +532,6 @@ static bool parse_option(int argc, char **argv) {
     };
 
     program_option.fill_zero = false;
-    program_option.memsize = -1;
     program_option.use_ts_profile_file = false;
     program_option.use_ts_profile_str = false;
     program_option.use_rw_offsets = false;
@@ -540,41 +541,34 @@ static bool parse_option(int argc, char **argv) {
 
     int longopt_idx;
     int flag;
+    char memsize_str[1024];
+
+    int memsize_flag = -1;
+    const char *memsize_flag_sig = "byte";
+    long long memsize_coef = 1LL;
     while ((flag = getopt_long(argc, argv, "", opts, &longopt_idx)) != -1) {
         switch (flag) {
             case FLAG_FILL_BUFFER_WITH_ZERO:
                 program_option.fill_zero = true;
                 break;
             case FLAG_MB:
-            {
-                long long mb;
-                if (!parsell(optarg, &mb)) {
-                    fprintf(stderr, "--mb: %s is not a number\n", optarg);
-                    return false;
-                }
-                program_option.memsize = mb * 1024 * 1024;
+                strncpy(memsize_str, optarg, 1023);
+                memsize_flag_sig = "mb";
+                memsize_coef = 1024LL * 1024LL;
+                memsize_flag = flag;
                 break;
-            }
             case FLAG_KB:
-            {
-                long long kb;
-                if (!parsell(optarg, &kb)) {
-                    fprintf(stderr, "--kb: %s is not a number\n", optarg);
-                    return false;
-                }
-                program_option.memsize = kb * 1024;
+                strncpy(memsize_str, optarg, 1023);
+                memsize_flag_sig = "kb";
+                memsize_coef = 1024LL;
+                memsize_flag = flag;
                 break;
-            }
             case FLAG_BYTE:
-            {
-                long long byte;
-                if (!parsell(optarg, &byte)) {
-                    fprintf(stderr, "--byte: %s is not a number\n", optarg);
-                    return false;
-                }
-                program_option.memsize = byte;
+                strncpy(memsize_str, optarg, 1023);
+                memsize_flag_sig = "mb";
+                memsize_coef = 1LL;
+                memsize_flag = flag;
                 break;
-            }
             case FLAG_TIMESTAMP_PROFILE:
             {
                 program_option.use_ts_profile_str = true;
@@ -621,14 +615,32 @@ static bool parse_option(int argc, char **argv) {
                 return false;
         }
     }
-    if (program_option.memsize == -1) {
+    if (memsize_flag == -1) {
         fprintf(stderr, "Memsize(byte, kb, mb) has not been specified!\n");
         return false;
     }
+
     if (program_option.gpu_flag == 0) {
         fprintf(stderr, "No gpu to use. abort.\n");
         return false;
     }
+
+    int idx;
+    long long memsize_size_t[MAX_GPU];
+    ssize_t memsize_cnt = parse_colon_str(memsize_str, MAX_GPU, memsize_size_t);
+    for (idx = 0; idx < MAX_GPU; idx++) {
+        program_option.memsize[idx] = (size_t)memsize_size_t[idx];
+    }
+
+    if (memsize_cnt <= 0) {
+        fprintf(stderr, "--%s: invalid format\n", memsize_flag_sig);
+        return false;
+    } else if (memsize_cnt == 1) {
+        for (idx = 1; idx < MAX_GPU; idx++)
+            program_option.memsize[idx] = program_option.memsize[0];
+    }
+    for (idx = 0; idx < MAX_GPU; idx++)
+        program_option.memsize[idx] *= memsize_coef;
     return true;
 }
 
@@ -645,6 +657,7 @@ static ssize_t parse_colon_str(char *s, size_t max_cnt, long long *out) {
 
         char num_str[1024];
         strncpy(num_str, p, next - p);
+        num_str[next - p] = 0;
         *(num_str + strlen(num_str)) = 0;
 
         char *endpnt;
@@ -670,8 +683,7 @@ static ssize_t parse_colon_str(char *s, size_t max_cnt, long long *out) {
 static bool get_memtest_shared_info(MemtestSharedInfo *shared_info, GpuLog *logger) {
     shared_info->randomize_buffer = !program_option.fill_zero;
     shared_info->logger = logger;
-    shared_info->memsize = program_option.memsize;
-
+    memcpy(shared_info->memsize, program_option.memsize, sizeof(shared_info->memsize[0]) * MAX_GPU);
 
     memset(shared_info->gpu_ts_profile, 0, sizeof(shared_info->gpu_ts_profile[0]) * MAX_GPU);
     memset(shared_info->rw_offsets, 0, sizeof(shared_info->rw_offsets[0]) * MAX_GPU);
@@ -758,22 +770,18 @@ int main(int argc, char** argv) {
     int gpu_idx = 0;
     unsigned long long gpu_iter;
     for (gpu_iter = program_option.gpu_flag; gpu_iter; gpu_iter >>= 1) {
-        if (gpu_iter & 1)
-            fprintf(stderr, "Use GPU%d\n", gpu_idx);
+        if (gpu_iter & 1) {
+            fprintf(stderr, "GPU%d -> ", gpu_idx);
+            fprintf(stderr, "Memory size: %zu Byte", program_option.memsize[gpu_idx]);
+            if (program_option.memsize[gpu_idx] >= 1024 * 1024) {
+                fprintf(stderr, "(%zu MB)", program_option.memsize[gpu_idx] / 1024 / 1024);
+            } else if (program_option.memsize[gpu_idx] >= 1024) {
+                fprintf(stderr, "(%zu KB)", program_option.memsize[gpu_idx] / 1024);
+            }
+            fprintf(stderr, "\n");
+        }
         gpu_idx++;
     }
-
-    if (program_option.memsize == 0) {
-        program_option.memsize = 1;
-    }
-
-    fprintf(stderr, "Memory size: %zu Byte", program_option.memsize);
-    if (program_option.memsize >= 1024 * 1024) {
-        fprintf(stderr, "(%zu MB)", program_option.memsize / 1024 / 1024);
-    } else if (program_option.memsize >= 1024) {
-        fprintf(stderr, "(%zu KB)", program_option.memsize / 1024);
-    }
-    fprintf(stderr, "\n");
 
     GpuLog logger;
     MemtestSharedInfo shared_info;
